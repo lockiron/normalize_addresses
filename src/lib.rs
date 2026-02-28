@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use regex::Regex;
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Point {
@@ -20,7 +21,7 @@ pub struct NormalizedAddress {
     pub other: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TownItem {
     pub town: String,
     pub koaza: String,
@@ -28,6 +29,49 @@ pub struct TownItem {
     pub lat: Option<f64>,
     #[serde(default)]
     pub lng: Option<f64>,
+}
+
+type CityMap = HashMap<String, Vec<String>>;
+static CITY_CACHE: OnceLock<Arc<CityMap>> = OnceLock::new();
+static TOWN_CACHE: OnceLock<Arc<Mutex<HashMap<String, Vec<TownItem>>>>> = OnceLock::new();
+
+async fn get_city_map() -> anyhow::Result<Arc<CityMap>> {
+    if let Some(cache) = CITY_CACHE.get() {
+        return Ok(Arc::clone(cache));
+    }
+    
+    let url_ja = "https://geolonia.github.io/japanese-addresses/api/ja.json";
+    let res = reqwest::get(url_ja).await?;
+    let data: CityMap = res.json().await?;
+    let arc_data = Arc::new(data);
+    let _ = CITY_CACHE.set(Arc::clone(&arc_data));
+    Ok(arc_data)
+}
+
+async fn get_towns(pref: &str, city: &str) -> anyhow::Result<Vec<TownItem>> {
+    let cache_lock = TOWN_CACHE.get_or_init(|| Arc::new(Mutex::new(HashMap::new())));
+    let key = format!("{}-{}", pref, city);
+    
+    {
+        let cache = cache_lock.lock().unwrap();
+        if let Some(towns) = cache.get(&key) {
+            return Ok(towns.clone());
+        }
+    }
+    
+    let url = format!("https://geolonia.github.io/japanese-addresses/api/ja/{}/{}.json", pref, city);
+    let res = reqwest::get(&url).await?;
+    if !res.status().is_success() {
+        anyhow::bail!("Failed to fetch town data: {}", res.status());
+    }
+    let towns: Vec<TownItem> = res.json().await?;
+    
+    {
+        let mut cache = cache_lock.lock().unwrap();
+        cache.insert(key, towns.clone());
+    }
+    
+    Ok(towns)
 }
 
 static PREFECTURES: [&str; 47] = [
@@ -54,56 +98,46 @@ pub async fn normalize_async(input: &str) -> anyhow::Result<NormalizedAddress> {
         }
     }
 
-    let url_ja = "https://geolonia.github.io/japanese-addresses/api/ja.json";
     let mut city = String::new();
 
     if pref.is_empty() {
         // Prefecture missing - infer from city
-        if let Ok(res) = reqwest::get(url_ja).await {
-            if res.status().is_success() {
-                if let Ok(data) = res.json::<std::collections::HashMap<String, Vec<String>>>().await {
-                    let mut candidates = vec![];
-                    for (p, cities) in data.iter() {
-                        let mut sorted_cities = cities.clone();
-                        sorted_cities.sort_by(|a, b| b.len().cmp(&a.len()));
-                        for c in sorted_cities {
-                            if s.starts_with(&c) {
-                                candidates.push((p.clone(), c.clone()));
-                            }
-                        }
-                    }
+        let city_map = get_city_map().await?;
+        let mut candidates = vec![];
+        for (p, cities) in city_map.iter() {
+            let mut sorted_cities = cities.clone();
+            sorted_cities.sort_by(|a, b| b.len().cmp(&a.len()));
+            for c in sorted_cities {
+                if s.starts_with(&c) {
+                    candidates.push((p.clone(), c.clone()));
+                    break; // Greedily take the longest city in this pref
+                }
+            }
+        }
 
-                    if candidates.len() == 1 {
-                        pref = candidates[0].0.clone();
-                        city = candidates[0].1.clone();
-                        s = s[city.len()..].trim().to_string();
-                    } else if candidates.len() > 1 {
-                        // Multiple cities match (e.g. "府中市") - try to resolve with town match
-                        for (p, c) in candidates {
-                            let url_towns = format!("https://geolonia.github.io/japanese-addresses/api/ja/{}/{}.json", p, c);
-                            if let Ok(res_towns) = reqwest::get(&url_towns).await {
-                                if res_towns.status().is_success() {
-                                    if let Ok(towns) = res_towns.json::<Vec<TownItem>>().await {
-                                        let s_after_city = s[c.len()..].trim().to_string();
-                                        for t in towns {
-                                            if let Some(pattern) = build_town_regex(&t.town) {
-                                                if let Ok(re) = Regex::new(&pattern) {
-                                                    if re.is_match(&s_after_city) {
-                                                        pref = p;
-                                                        city = c;
-                                                        s = s_after_city;
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+        if candidates.len() == 1 {
+            pref = candidates[0].0.clone();
+            city = candidates[0].1.clone();
+            s = s[city.len()..].trim().to_string();
+        } else if candidates.len() > 1 {
+            // Multiple cities match (e.g. "府中市") - try to resolve with town match
+            for (p, c) in candidates {
+                if let Ok(towns) = get_towns(&p, &c).await {
+                    let s_after_city = s[c.len()..].trim().to_string();
+                    for t in towns {
+                        if let Some(pattern) = build_town_regex(&t.town) {
+                            if let Ok(re) = Regex::new(&pattern) {
+                                if re.is_match(&s_after_city) {
+                                    pref = p;
+                                    city = c;
+                                    s = s_after_city;
+                                    break;
                                 }
                             }
-                            if !pref.is_empty() { break; }
                         }
                     }
                 }
+                if !pref.is_empty() { break; }
             }
         }
     }
@@ -122,19 +156,15 @@ pub async fn normalize_async(input: &str) -> anyhow::Result<NormalizedAddress> {
 
     if city.is_empty() {
         // 2. City (if not already inferred)
-        if let Ok(res) = reqwest::get(url_ja).await {
-            if res.status().is_success() {
-                if let Ok(mut data) = res.json::<std::collections::HashMap<String, Vec<String>>>().await {
-                    if let Some(mut cities) = data.remove(&pref) {
-                        cities.sort_by(|a, b| b.len().cmp(&a.len()));
-                        for c in cities {
-                            if s.starts_with(&c) {
-                                city = c.clone();
-                                s = s[c.len()..].trim().to_string();
-                                break;
-                            }
-                        }
-                    }
+        let city_map = get_city_map().await?;
+        if let Some(cities) = city_map.get(&pref) {
+            let mut sorted_cities = cities.clone();
+            sorted_cities.sort_by(|a, b| b.len().cmp(&a.len()));
+            for c in sorted_cities {
+                if s.starts_with(&c) {
+                    city = c.clone();
+                    s = s[c.len()..].trim().to_string();
+                    break;
                 }
             }
         }
@@ -146,27 +176,14 @@ pub async fn normalize_async(input: &str) -> anyhow::Result<NormalizedAddress> {
             city: "".to_string(),
             town: "".to_string(),
             addr: s,
-            level: 1, // Prefecture level
+            level: 1,
             point: None,
             other: "".to_string(),
         });
     }
 
-    // 3. Fetch town data
-    let url = format!("https://geolonia.github.io/japanese-addresses/api/ja/{}/{}.json", pref, city);
-    let response = reqwest::get(&url).await;
-
-    let mut towns: Vec<TownItem> = vec![];
-    if let Ok(res) = response {
-        if res.status().is_success() {
-            if let Ok(data) = res.json::<Vec<TownItem>>().await {
-                towns = data;
-            }
-        }
-    }
-
-    // 4. Town match
-    // Sort towns by descending length to match longest first
+    // 3. Towns
+    let mut towns = get_towns(&pref, &city).await.unwrap_or_default();
     towns.sort_by(|a, b| b.town.len().cmp(&a.town.len()));
 
     let mut matched_town = None;
@@ -192,8 +209,6 @@ pub async fn normalize_async(input: &str) -> anyhow::Result<NormalizedAddress> {
 
     if let Some((t, point)) = matched_town {
         let level = if point.is_some() { 8 } else { 3 };
-        
-        // Strip leading hyphen from remaining addr if present
         let addr = if remaining.starts_with('-') {
             remaining[1..].to_string()
         } else {
@@ -211,14 +226,12 @@ pub async fn normalize_async(input: &str) -> anyhow::Result<NormalizedAddress> {
         });
     }
 
-    // No town match
-    let level = if city.is_empty() { 1 } else { 3 };
     Ok(NormalizedAddress {
         pref,
         city,
         town: "".to_string(),
         addr: s,
-        level,
+        level: 3,
         point: None,
         other: "".to_string(),
     })
@@ -391,9 +404,12 @@ mod tests {
         assert_eq!(number_to_kanji(1234), "千二百三十四");
     }
 
-    #[test]
-    fn test_find_original_len() {
-        assert_eq!(find_original_len("24軒2条", "二十四軒二条"), "24軒2条".len());
-        assert_eq!(find_original_len("24-2-2-3-3", "二十四-二-二"), "24-2-2".len());
+    #[tokio::test]
+    async fn test_normalize() {
+        let res = normalize_async("北海道札幌市西区24-2-2-3-3").await.unwrap();
+        assert_eq!(res.pref, "北海道");
+        assert_eq!(res.city, "札幌市西区");
+        assert_eq!(res.town, "二十四軒二条二丁目");
+        assert_eq!(res.addr, "3-3");
     }
 }
