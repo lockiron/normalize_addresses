@@ -15,7 +15,6 @@ pub struct NormalizedAddress {
     pub pref: String,
     pub city: String,
     pub town: String,
-    pub addr: String,
     pub level: u8,
     pub point: Option<Point>,
     pub other: String,
@@ -86,7 +85,18 @@ static PREFECTURES: [&str; 47] = [
 
 
 pub async fn normalize_async(input: &str) -> anyhow::Result<NormalizedAddress> {
-    let mut s = input.trim().to_string();
+    let mut s = input.trim().replace([' ', '　'], "");
+    
+    // Zenkaku digits to Hankaku and normalize dashes
+    let mut normalized = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '０'..='９' => normalized.push(char::from_u32(c as u32 - 0xFEE0).unwrap()),
+            '－' | '−' | '‐' | '―' | 'ー' => normalized.push('-'),
+            _ => normalized.push(c),
+        }
+    }
+    s = normalized;
 
     // 1. Prefecture
     let mut pref = String::new();
@@ -147,10 +157,9 @@ pub async fn normalize_async(input: &str) -> anyhow::Result<NormalizedAddress> {
             pref: "".to_string(),
             city: "".to_string(),
             town: "".to_string(),
-            addr: s,
             level: 0,
             point: None,
-            other: "".to_string(),
+            other: s,
         });
     }
 
@@ -175,10 +184,9 @@ pub async fn normalize_async(input: &str) -> anyhow::Result<NormalizedAddress> {
             pref,
             city: "".to_string(),
             town: "".to_string(),
-            addr: s,
             level: 1,
             point: None,
-            other: "".to_string(),
+            other: s,
         });
     }
 
@@ -197,7 +205,7 @@ pub async fn normalize_async(input: &str) -> anyhow::Result<NormalizedAddress> {
                         remaining = s[m.end()..].trim().to_string();
                         let mut point = None;
                         if let (Some(lat), Some(lng)) = (t.lat, t.lng) {
-                            point = Some(Point { lat, lng, level: 8 });
+                            point = Some(Point { lat, lng, level: 3 });
                         }
                         matched_town = Some((t.town, point));
                         break;
@@ -208,8 +216,7 @@ pub async fn normalize_async(input: &str) -> anyhow::Result<NormalizedAddress> {
     }
 
     if let Some((t, point)) = matched_town {
-        let level = if point.is_some() { 8 } else { 3 };
-        let addr = if remaining.starts_with('-') {
+        let other = if remaining.starts_with('-') {
             remaining[1..].to_string()
         } else {
             remaining
@@ -219,10 +226,9 @@ pub async fn normalize_async(input: &str) -> anyhow::Result<NormalizedAddress> {
             pref,
             city,
             town: t,
-            addr,
-            level,
+            level: 3,
             point,
-            other: "".to_string(),
+            other,
         });
     }
 
@@ -230,10 +236,9 @@ pub async fn normalize_async(input: &str) -> anyhow::Result<NormalizedAddress> {
         pref,
         city,
         town: "".to_string(),
-        addr: s,
         level: 3,
         point: None,
-        other: "".to_string(),
+        other: s,
     })
 }
 
@@ -405,11 +410,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_normalize() {
+    async fn test_normalize_sapporo() {
         let res = normalize_async("北海道札幌市西区24-2-2-3-3").await.unwrap();
         assert_eq!(res.pref, "北海道");
         assert_eq!(res.city, "札幌市西区");
         assert_eq!(res.town, "二十四軒二条二丁目");
-        assert_eq!(res.addr, "3-3");
+        assert_eq!(res.other, "3-3");
+        assert_eq!(res.level, 3);
+        assert!(res.point.is_some());
+        let p = res.point.unwrap();
+        assert_eq!(p.level, 3);
     }
 }

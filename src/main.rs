@@ -19,7 +19,6 @@ async fn main() -> Result<()> {
         "pref": normalized.pref,
         "city": normalized.city,
         "town": normalized.town,
-        "addr": normalized.addr,
         "level": normalized.level,
         "point": normalized.point,
         "other": normalized.other,
